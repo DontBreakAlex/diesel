@@ -347,3 +347,162 @@ mod bigdecimal {
         }
     }
 }
+
+#[cfg(feature = "postgres_backend")]
+mod string {
+    use crate::deserialize::{self, FromSql};
+    use crate::pg::data_types::PgNumeric;
+    use crate::pg::{Pg, PgValue};
+    use crate::serialize::{self, Output, ToSql};
+    use crate::sql_types::Numeric;
+
+    use std::error::Error;
+
+    impl<'a> From<&'a PgNumeric> for String {
+        fn from(numeric: &'a PgNumeric) -> Self {
+            let mut result = String::new();
+            match *numeric {
+                PgNumeric::Positive {
+                    weight,
+                    scale,
+                    ref digits,
+                } => {
+                    result.push_str(&format!("+{}.", digits[0]));
+                    for digit in digits.iter().skip(1) {
+                        result.push_str(&format!("{:04}", digit));
+                    }
+                    result.push_str(&format!("e{}", weight - scale as i16));
+                }
+                PgNumeric::Negative {
+                    weight,
+                    scale,
+                    ref digits,
+                } => {
+                    result.push_str(&format!("-{}.", digits[0]));
+                    for digit in digits.iter().skip(1) {
+                        result.push_str(&format!("{:04}", digit));
+                    }
+                    result.push_str(&format!("e{}", weight - scale as i16));
+                }
+                PgNumeric::NaN => {
+                    result.push_str("NaN");
+                }
+            }
+
+            result
+        }
+    }
+
+    impl From<PgNumeric> for String {
+
+        fn from(numeric: PgNumeric) -> Self {
+            (&numeric).into()
+        }
+    }
+
+    impl<'a> TryFrom<&'a str> for PgNumeric {
+        type Error = Box<dyn Error + Send + Sync>;
+
+        fn try_from(s: &'a str) -> deserialize::Result<Self> {
+            let mut s = s.chars();
+            let sign = match s.next() {
+                Some('+') => 0,
+                Some('-') => 0x4000,
+                Some('N') => {
+                    if s.next() == Some('a') && s.next() == Some('N') {
+                        0xC000
+                    } else {
+                        return Err(Box::from("Invalid NaN representation"));
+                    }
+                }
+                Some(_) => return Err(Box::from("Invalid sign for numeric field")),
+                None => return Err(Box::from("Empty string")),
+            };
+
+            let mut digits = Vec::new();
+            let mut weight = 0;
+            let mut scale = 0;
+            let mut current_digit = 0;
+            let mut current_digit_weight = 0;
+            let mut in_scale = false;
+            for c in s {
+                match c {
+                    '.' => {
+                        in_scale = true;
+                    }
+                    'e' => {
+                        let weight = i16::from_str_radix(&s.collect::<String>(), 10)?;
+                        return Ok(match sign {
+                            0 => PgNumeric::Positive {
+                                weight,
+                                scale,
+                                digits,
+                            },
+                            0x4000 => PgNumeric::Negative {
+                                weight,
+                                scale,
+                                digits,
+                            },
+                            0xC000 => PgNumeric::NaN,
+                            _ => unreachable!(),
+                        });
+                    }
+                    _ => {
+                        let digit = c.to_digit(10).ok_or("Invalid digit")?;
+                        if in_scale {
+                            scale += 1;
+                        }
+                        current_digit = current_digit * 10 + digit;
+                        current_digit_weight += 1;
+                        if current_digit_weight == 4 {
+                            digits.push(current_digit as i16);
+                            current_digit = 0;
+                            current_digit_weight = 0;
+                        }
+                    }
+                }
+            }
+
+            if current_digit_weight != 0 {
+                digits.push(current_digit as i16);
+            }
+
+            Ok(match sign {
+                0 => PgNumeric::Positive {
+                    weight,
+                    scale,
+                    digits,
+                },
+                0x4000 => PgNumeric::Negative {
+                    weight,
+                    scale,
+                    digits,
+                },
+                0xC000 => PgNumeric::NaN,
+                _ => unreachable!(),
+            })
+        }
+    }
+
+    impl TryFrom<String> for PgNumeric {
+        type Error = Box<dyn Error + Send + Sync>;
+
+        fn try_from(s: String) -> deserialize::Result<Self> {
+            s.as_str().try_into()
+        }
+    }
+
+    impl ToSql<Numeric, Pg> for String {
+        fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> serialize::Result {
+            let numeric = PgNumeric::try_from(self.as_str())?;
+            ToSql::<Numeric, Pg>::to_sql(&numeric, &mut out.reborrow())
+        }
+    }
+
+    impl FromSql<Numeric, Pg> for String {
+        fn from_sql(numeric: PgValue<'_>) -> deserialize::Result<Self> {
+            PgNumeric::from_sql(numeric).map(|numeric| numeric.into())
+        }
+    }
+
+}
